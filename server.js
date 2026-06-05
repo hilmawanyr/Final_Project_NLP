@@ -3,12 +3,14 @@ import cors from "cors";
 import dotenv from "dotenv";
 import multer from "multer";
 import { parse } from "csv-parse/sync";
+import swaggerUi from "swagger-ui-express";
 import {
   analysisResultSchema,
   batchRequestSchema,
   csvRowSchema,
   reviewRequestSchema
 } from "./schemas.js";
+import openapiSpec from "./openapi.js";
 
 dotenv.config();
 
@@ -27,6 +29,10 @@ const allowedModels = (process.env.OPENROUTER_MODELS || defaultOpenRouterModel)
 
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
+app.get("/openapi.json", (_req, res) => {
+  res.json(openapiSpec);
+});
+app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(openapiSpec));
 
 function ratingToSentiment(rating) {
   if (rating <= 2) return "Negative";
@@ -172,6 +178,13 @@ app.post("/analyze-batch", async (req, res) => {
 
     res.json(results);
   } catch (error) {
+    if (error instanceof Error && error.message.startsWith("Model not allowed:")) {
+      return res.status(400).json({
+        error: "Invalid model",
+        message: error.message,
+        allowed_models: allowedModels
+      });
+    }
     res.status(500).json({
       error: "Batch analysis failed",
       message: error instanceof Error ? error.message : "Unknown error"
@@ -202,6 +215,13 @@ app.post("/analyze-bulk", upload.single("file"), async (req, res) => {
       results
     });
   } catch (error) {
+    if (error instanceof Error && error.message.startsWith("Model not allowed:")) {
+      return res.status(400).json({
+        error: "Invalid model",
+        message: error.message,
+        allowed_models: allowedModels
+      });
+    }
     res.status(500).json({
       error: "Bulk analysis failed",
       message: error instanceof Error ? error.message : "Unknown error"
