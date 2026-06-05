@@ -1,29 +1,32 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-import { z } from "zod";
+import multer from "multer";
+import { parse } from "csv-parse/sync";
+import {
+  analysisResultSchema,
+  batchRequestSchema,
+  csvRowSchema,
+  reviewRequestSchema
+} from "./schemas.js";
 
 dotenv.config();
 
 const app = express();
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 }
+});
 const port = process.env.PORT || 3000;
 const openRouterApiKey = process.env.OPENROUTER_API_KEY?.trim();
-const openRouterModel = process.env.OPENROUTER_MODEL || "google/gemini-3.1-flash-lite";
+const defaultOpenRouterModel = process.env.OPENROUTER_MODEL?.trim() || "google/gemini-3.1-flash-lite";
+const allowedModels = (process.env.OPENROUTER_MODELS || defaultOpenRouterModel)
+  .split(",")
+  .map((model) => model.trim())
+  .filter(Boolean);
 
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
-
-const requestSchema = z.object({
-  review_text: z.string().min(1),
-  rating: z.number().int().min(1).max(5)
-});
-
-const analysisSchema = z.object({
-  predicted_sentiment: z.enum(["Positive", "Neutral", "Negative"]),
-  rating_sentiment: z.enum(["Positive", "Neutral", "Negative"]),
-  is_consistent: z.boolean(),
-  explanation: z.string().min(1)
-});
 
 function ratingToSentiment(rating) {
   if (rating <= 2) return "Negative";
@@ -31,10 +34,30 @@ function ratingToSentiment(rating) {
   return "Positive";
 }
 
-async function analyzeWithOpenRouter(review_text, rating) {
+function normalizeCsvRows(buffer) {
+  const records = parse(buffer, {
+    bom: true,
+    columns: true,
+    skip_empty_lines: true,
+    trim: true
+  });
+
+  return records.map((row) => csvRowSchema.parse(row));
+}
+
+function resolveModel(requestedModel) {
+  const selectedModel = requestedModel?.trim() || defaultOpenRouterModel;
+  if (!allowedModels.includes(selectedModel)) {
+    throw new Error(`Model not allowed: ${selectedModel}`);
+  }
+  return selectedModel;
+}
+
+async function analyzeWithOpenRouter(review_text, rating, model) {
   if (!openRouterApiKey) {
     throw new Error("OPENROUTER_API_KEY is missing from .env or not loaded");
   }
+  const selectedModel = resolveModel(model);
 
   const prompt = [
     {
@@ -61,7 +84,7 @@ async function analyzeWithOpenRouter(review_text, rating) {
       "X-Title": process.env.OPENROUTER_APP_NAME
     },
     body: JSON.stringify({
-      model: openRouterModel,
+      model: selectedModel,
       messages: prompt,
       temperature: 0,
       response_format: { type: "json_object" }
@@ -79,20 +102,28 @@ async function analyzeWithOpenRouter(review_text, rating) {
     throw new Error("OpenRouter returned no content");
   }
 
-  const parsed = analysisSchema.parse(JSON.parse(content));
+  const parsed = analysisResultSchema.parse(JSON.parse(content));
   return parsed;
 }
 
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
-    model: openRouterModel,
+    default_model: defaultOpenRouterModel,
+    allowed_models: allowedModels,
     has_api_key: Boolean(openRouterApiKey)
   });
 });
 
+app.get("/models", (_req, res) => {
+  res.json({
+    default_model: defaultOpenRouterModel,
+    allowed_models: allowedModels
+  });
+});
+
 app.post("/analyze", async (req, res) => {
-  const input = requestSchema.safeParse(req.body);
+  const input = reviewRequestSchema.safeParse(req.body);
   if (!input.success) {
     return res.status(400).json({
       error: "Invalid request body",
@@ -101,9 +132,20 @@ app.post("/analyze", async (req, res) => {
   }
 
   try {
-    const result = await analyzeWithOpenRouter(input.data.review_text, input.data.rating);
+    const result = await analyzeWithOpenRouter(
+      input.data.review_text,
+      input.data.rating,
+      input.data.model
+    );
     res.json(result);
   } catch (error) {
+    if (error instanceof Error && error.message.startsWith("Model not allowed:")) {
+      return res.status(400).json({
+        error: "Invalid model",
+        message: error.message,
+        allowed_models: allowedModels
+      });
+    }
     res.status(500).json({
       error: "Analysis failed",
       message: error instanceof Error ? error.message : "Unknown error"
@@ -112,11 +154,7 @@ app.post("/analyze", async (req, res) => {
 });
 
 app.post("/analyze-batch", async (req, res) => {
-  const batchSchema = z.object({
-    reviews: z.array(requestSchema).min(1)
-  });
-
-  const input = batchSchema.safeParse(req.body);
+  const input = batchRequestSchema.safeParse(req.body);
   if (!input.success) {
     return res.status(400).json({
       error: "Invalid request body",
@@ -125,9 +163,10 @@ app.post("/analyze-batch", async (req, res) => {
   }
 
   try {
+    const selectedModel = resolveModel(input.data.model);
     const results = [];
     for (const review of input.data.reviews) {
-      const result = await analyzeWithOpenRouter(review.review_text, review.rating);
+      const result = await analyzeWithOpenRouter(review.review_text, review.rating, selectedModel);
       results.push(result);
     }
 
@@ -135,6 +174,36 @@ app.post("/analyze-batch", async (req, res) => {
   } catch (error) {
     res.status(500).json({
       error: "Batch analysis failed",
+      message: error instanceof Error ? error.message : "Unknown error"
+    });
+  }
+});
+
+app.post("/analyze-bulk", upload.single("file"), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({
+      error: "Missing CSV file",
+      message: "Upload a file field named 'file' with a CSV attachment."
+    });
+  }
+
+  try {
+    const rows = normalizeCsvRows(req.file.buffer);
+    const selectedModel = resolveModel(req.body.model);
+    const results = [];
+
+    for (const row of rows) {
+      const result = await analyzeWithOpenRouter(row.review_text, row.rating, selectedModel);
+      results.push(result);
+    }
+
+    res.json({
+      total_rows: rows.length,
+      results
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: "Bulk analysis failed",
       message: error instanceof Error ? error.message : "Unknown error"
     });
   }
