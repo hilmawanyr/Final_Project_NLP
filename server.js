@@ -410,23 +410,50 @@ app.post("/scrape", async (req, res) => {
             tags: ["scrape"],
         },
         async (span) => {
-            const resBucket = await Promise.all(
-                data.reviews.map(async (d) => {
-                    const scrapeRvw = await analyzeWithOpenRouter(
-                        d.text,
-                        d.rating,
-                        model,
-                    );
-                    return scrapeRvw;
-                }),
-            );
+            try {
+                const resBucket = await Promise.all(
+                    data.reviews.map(async (d) => {
+                        const scrapeRvw = await analyzeWithOpenRouter(
+                            d.text,
+                            d.rating,
+                            model,
+                        );
+                        return scrapeRvw;
+                    }),
+                );
 
-            span?.update({ output: resBucket });
+                span?.update({ output: resBucket });
 
-            res.json({
-                total_rows: data.reviews.length,
-                results: resBucket,
-            });
+                res.json({
+                    total_rows: data.reviews.length,
+                    results: resBucket,
+                });
+            } catch (error) {
+                span?.update({
+                    level: "ERROR",
+                    statusMessage:
+                        error instanceof Error
+                            ? error.message
+                            : "Unknown error",
+                });
+                if (
+                    error instanceof Error &&
+                    error.message.startsWith("Model not allowed:")
+                ) {
+                    return res.status(400).json({
+                        error: "Invalid model",
+                        message: error.message,
+                        allowed_models: allowedModels,
+                    });
+                }
+                res.status(500).json({
+                    error: "Scrape analysis failed",
+                    message:
+                        error instanceof Error
+                            ? error.message
+                            : "Unknown error",
+                });
+            }
         },
     );
 });
