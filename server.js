@@ -155,8 +155,6 @@ async function analyzeWithOpenRouter(review_text, rating, model) {
         throw new Error("OpenRouter returned no content");
     }
 
-    console.log("OpenRouter response:", content);
-
     const parsed = analysisResultSchema.parse(JSON.parse(content));
     return parsed;
 }
@@ -387,7 +385,7 @@ app.post("/scrape", async (req, res) => {
             "Content-Type": "application/json",
             Authorization: `Bearer ${ScraperAppToken}`,
         },
-        body: JSON.stringify({ url, max_rvw: total_reviews }),
+        body: JSON.stringify({ url, total_reviews }),
     });
 
     if (!reviews.ok) {
