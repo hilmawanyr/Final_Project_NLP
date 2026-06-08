@@ -3,3 +3,4 @@ summary.md
 .env.example
 /node_modules
 .zed
+jsconfig.json
