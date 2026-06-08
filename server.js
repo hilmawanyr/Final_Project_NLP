@@ -39,7 +39,7 @@ app.get("/openapi.json", (_req, res) => {
 app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(openapiSpec));
 
 function ratingToSentiment(rating) {
-    if (rating <= 2) return "Negative";
+    if (rating <= 2) return "Genuine Negative";
     if (rating === 3) return "Neutral";
     return "Positive";
 }
@@ -76,10 +76,12 @@ async function analyzeWithOpenRouter(review_text, rating, model) {
             role: "system",
             content: `You analyze Indonesian e-commerce reviews. Return only valid JSON with keys predicted_sentiment,
             rating_sentiment, is_consistent, explanation, confidence_percentage.
-            Keep predicted_sentiment and rating_sentiment exactly as Positive, Neutral, or
-            Negative because the code depends on those values. Write explanation in Bahasa Indonesia.
-            Be careful with slang, emojis, and mixed Indonesian-English text. Consider sarcasm as a Negative sentiment.
-            Sarcasm is characterized by high ratings and negative comments. For confidence_percentage must be in integer type.`,
+            Keep predicted_sentiment and rating_sentiment exactly as Positive, Neutral, Irrelevant, Sarcastic Negative, or
+            Genuine Negative because the code depends on those values. Irrelevant is when the rating is low but the comments are positive.
+            Sarcastic Negative is characterized by high ratings and negative comments.
+            Write explanation in Bahasa Indonesia.
+            Be careful with slang, emojis, and mixed Indonesian-English text.
+            For confidence_percentage must be in integer type.`,
         },
         {
             role: "user",

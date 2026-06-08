@@ -2,7 +2,9 @@ import { z } from "zod";
 
 const positive = "Positive";
 const neutral = "Neutral";
-const negative = "Negative";
+const irrelevant = "Irrelevant";
+const sarcastic = "Sarcastic Negative";
+const negative = "Genuine Negative";
 
 export const reviewRequestSchema = z.object({
     review_text: z.string().min(1),
@@ -16,8 +18,20 @@ export const csvRowSchema = z.object({
 });
 
 export const analysisResultSchema = z.object({
-    predicted_sentiment: z.enum([positive, neutral, negative]),
-    rating_sentiment: z.enum([positive, neutral, negative]),
+    predicted_sentiment: z.enum([
+        positive,
+        neutral,
+        irrelevant,
+        sarcastic,
+        negative,
+    ]),
+    rating_sentiment: z.enum([
+        positive,
+        neutral,
+        irrelevant,
+        sarcastic,
+        negative,
+    ]),
     is_consistent: z.boolean(),
     explanation: z.string().min(1),
     confidence_percentage: z.number(),
