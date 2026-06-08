@@ -1,9 +1,19 @@
+// Must be imported first so OpenTelemetry is initialized before the OpenAI
+// client is created and instrumented.
+import {
+    langfuseEnabled,
+    flushTracing,
+    shutdownTracing,
+} from "./instrumentation.js";
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import multer from "multer";
 import { parse } from "csv-parse/sync";
 import swaggerUi from "swagger-ui-express";
+import OpenAI from "openai";
+import { observeOpenAI } from "@langfuse/openai";
+import { startActiveObservation, propagateAttributes } from "@langfuse/tracing";
 import {
     analysisResultSchema,
     batchRequestSchema,
@@ -63,6 +73,36 @@ function resolveModel(requestedModel) {
     return selectedModel;
 }
 
+// OpenRouter is OpenAI-compatible, so we use the OpenAI SDK pointed at its base
+// URL. Constructed lazily so the server can still boot (and warn) without a key.
+let _openRouterClient = null;
+function getOpenRouterClient() {
+    if (!_openRouterClient) {
+        _openRouterClient = new OpenAI({
+            apiKey: openRouterApiKey,
+            baseURL: "https://openrouter.ai/api/v1",
+            defaultHeaders: {
+                "HTTP-Referer": process.env.OPENROUTER_SITE_URL,
+                "X-Title": process.env.OPENROUTER_APP_NAME,
+            },
+        });
+    }
+    return _openRouterClient;
+}
+
+// Wraps an Express handler in a Langfuse trace (a root span whose name becomes
+// the trace name). LLM generations created inside `handler` nest under it
+// automatically via OpenTelemetry context. No-op when tracing is disabled.
+async function withTrace(name, { tags, ...attributes } = {}, handler) {
+    if (!langfuseEnabled) return handler();
+    const run = () =>
+        startActiveObservation(name, async (span) => {
+            span.update(attributes);
+            return handler(span);
+        });
+    return tags ? propagateAttributes({ tags }, run) : run();
+}
+
 async function analyzeWithOpenRouter(review_text, rating, model) {
     if (!openRouterApiKey) {
         throw new Error(
@@ -70,6 +110,7 @@ async function analyzeWithOpenRouter(review_text, rating, model) {
         );
     }
     const selectedModel = resolveModel(model);
+    const ratingSentiment = ratingToSentiment(rating);
 
     const prompt = [
         {
@@ -88,39 +129,28 @@ async function analyzeWithOpenRouter(review_text, rating, model) {
             content: JSON.stringify({
                 review_text,
                 rating,
-                rating_sentiment: ratingToSentiment(rating),
+                rating_sentiment: ratingSentiment,
             }),
         },
     ];
 
-    const response = await fetch(
-        "https://openrouter.ai/api/v1/chat/completions",
-        {
-            method: "POST",
-            headers: {
-                Authorization: `Bearer ${openRouterApiKey}`,
-                "Content-Type": "application/json",
-                "HTTP-Referer": process.env.OPENROUTER_SITE_URL,
-                "X-Title": process.env.OPENROUTER_APP_NAME,
-            },
-            body: JSON.stringify({
-                model: selectedModel,
-                messages: prompt,
-                temperature: 0,
-                response_format: { type: "json_object" },
-            }),
-        },
-    );
+    // observeOpenAI records this call as a Langfuse generation, automatically
+    // capturing the model, token usage, and input/output messages.
+    const client = langfuseEnabled
+        ? observeOpenAI(getOpenRouterClient(), {
+              generationName: "review-consistency-analysis",
+              generationMetadata: { rating, rating_sentiment: ratingSentiment },
+          })
+        : getOpenRouterClient();
 
-    if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(
-            `OpenRouter request failed: ${response.status} ${errorText}`,
-        );
-    }
+    const completion = await client.chat.completions.create({
+        model: selectedModel,
+        messages: prompt,
+        temperature: 0,
+        response_format: { type: "json_object" },
+    });
 
-    const data = await response.json();
-    const content = data?.choices?.[0]?.message?.content;
+    const content = completion?.choices?.[0]?.message?.content;
     if (!content) {
         throw new Error("OpenRouter returned no content");
     }
@@ -137,6 +167,7 @@ app.get("/health", (_req, res) => {
         default_model: defaultOpenRouterModel,
         allowed_models: allowedModels,
         has_api_key: Boolean(openRouterApiKey),
+        langfuse_enabled: langfuseEnabled,
     });
 });
 
@@ -156,29 +187,50 @@ app.post("/analyze", async (req, res) => {
         });
     }
 
-    try {
-        const result = await analyzeWithOpenRouter(
-            input.data.review_text,
-            input.data.rating,
-            input.data.model,
-        );
-        res.json(result);
-    } catch (error) {
-        if (
-            error instanceof Error &&
-            error.message.startsWith("Model not allowed:")
-        ) {
-            return res.status(400).json({
-                error: "Invalid model",
-                message: error.message,
-                allowed_models: allowedModels,
-            });
-        }
-        res.status(500).json({
-            error: "Analysis failed",
-            message: error instanceof Error ? error.message : "Unknown error",
-        });
-    }
+    await withTrace(
+        "analyze-review",
+        {
+            input: input.data,
+            metadata: { endpoint: "/analyze" },
+            tags: ["analyze"],
+        },
+        async (span) => {
+            try {
+                const result = await analyzeWithOpenRouter(
+                    input.data.review_text,
+                    input.data.rating,
+                    input.data.model,
+                );
+                span?.update({ output: result });
+                res.json(result);
+            } catch (error) {
+                span?.update({
+                    level: "ERROR",
+                    statusMessage:
+                        error instanceof Error
+                            ? error.message
+                            : "Unknown error",
+                });
+                if (
+                    error instanceof Error &&
+                    error.message.startsWith("Model not allowed:")
+                ) {
+                    return res.status(400).json({
+                        error: "Invalid model",
+                        message: error.message,
+                        allowed_models: allowedModels,
+                    });
+                }
+                res.status(500).json({
+                    error: "Analysis failed",
+                    message:
+                        error instanceof Error
+                            ? error.message
+                            : "Unknown error",
+                });
+            }
+        },
+    );
 });
 
 app.post("/analyze-batch", async (req, res) => {
@@ -190,35 +242,59 @@ app.post("/analyze-batch", async (req, res) => {
         });
     }
 
-    try {
-        const selectedModel = resolveModel(input.data.model);
-        const results = [];
-        for (const review of input.data.reviews) {
-            const result = await analyzeWithOpenRouter(
-                review.review_text,
-                review.rating,
-                selectedModel,
-            );
-            results.push(result);
-        }
+    await withTrace(
+        "analyze-batch",
+        {
+            input: input.data,
+            metadata: {
+                endpoint: "/analyze-batch",
+                review_count: input.data.reviews.length,
+            },
+            tags: ["analyze-batch"],
+        },
+        async (span) => {
+            try {
+                const selectedModel = resolveModel(input.data.model);
+                const results = [];
+                for (const review of input.data.reviews) {
+                    const result = await analyzeWithOpenRouter(
+                        review.review_text,
+                        review.rating,
+                        selectedModel,
+                    );
+                    results.push(result);
+                }
 
-        res.json(results);
-    } catch (error) {
-        if (
-            error instanceof Error &&
-            error.message.startsWith("Model not allowed:")
-        ) {
-            return res.status(400).json({
-                error: "Invalid model",
-                message: error.message,
-                allowed_models: allowedModels,
-            });
-        }
-        res.status(500).json({
-            error: "Batch analysis failed",
-            message: error instanceof Error ? error.message : "Unknown error",
-        });
-    }
+                span?.update({ output: results });
+                res.json(results);
+            } catch (error) {
+                span?.update({
+                    level: "ERROR",
+                    statusMessage:
+                        error instanceof Error
+                            ? error.message
+                            : "Unknown error",
+                });
+                if (
+                    error instanceof Error &&
+                    error.message.startsWith("Model not allowed:")
+                ) {
+                    return res.status(400).json({
+                        error: "Invalid model",
+                        message: error.message,
+                        allowed_models: allowedModels,
+                    });
+                }
+                res.status(500).json({
+                    error: "Batch analysis failed",
+                    message:
+                        error instanceof Error
+                            ? error.message
+                            : "Unknown error",
+                });
+            }
+        },
+    );
 });
 
 app.post("/analyze-bulk", upload.single("file"), async (req, res) => {
@@ -229,40 +305,68 @@ app.post("/analyze-bulk", upload.single("file"), async (req, res) => {
         });
     }
 
-    try {
-        const rows = normalizeCsvRows(req.file.buffer);
-        const selectedModel = resolveModel(req.body.model);
-        const results = [];
+    await withTrace(
+        "analyze-bulk",
+        {
+            metadata: {
+                endpoint: "/analyze-bulk",
+                filename: req.file.originalname,
+            },
+            tags: ["analyze-bulk"],
+        },
+        async (span) => {
+            try {
+                const rows = normalizeCsvRows(req.file.buffer);
+                const selectedModel = resolveModel(req.body.model);
+                const results = [];
 
-        for (const row of rows) {
-            const result = await analyzeWithOpenRouter(
-                row.review_text,
-                row.rating,
-                selectedModel,
-            );
-            results.push(result);
-        }
+                span?.update({
+                    input: { total_rows: rows.length, model: selectedModel },
+                    metadata: { row_count: rows.length },
+                });
 
-        res.json({
-            total_rows: rows.length,
-            results,
-        });
-    } catch (error) {
-        if (
-            error instanceof Error &&
-            error.message.startsWith("Model not allowed:")
-        ) {
-            return res.status(400).json({
-                error: "Invalid model",
-                message: error.message,
-                allowed_models: allowedModels,
-            });
-        }
-        res.status(500).json({
-            error: "Bulk analysis failed",
-            message: error instanceof Error ? error.message : "Unknown error",
-        });
-    }
+                for (const row of rows) {
+                    const result = await analyzeWithOpenRouter(
+                        row.review_text,
+                        row.rating,
+                        selectedModel,
+                    );
+                    results.push(result);
+                }
+
+                span?.update({ output: results });
+                res.json({
+                    total_rows: rows.length,
+                    results,
+                });
+            } catch (error) {
+                span?.update({
+                    level: "ERROR",
+                    statusMessage:
+                        error instanceof Error
+                            ? error.message
+                            : "Unknown error",
+                });
+                if (
+                    error instanceof Error &&
+                    error.message.startsWith("Model not allowed:")
+                ) {
+                    return res.status(400).json({
+                        error: "Invalid model",
+                        message: error.message,
+                        allowed_models: allowedModels,
+                    });
+                }
+                res.status(500).json({
+                    error: "Bulk analysis failed",
+                    message:
+                        error instanceof Error
+                            ? error.message
+                            : "Unknown error",
+                });
+            }
+        },
+    );
 });
 
 app.post("/scrape", async (req, res) => {
@@ -294,21 +398,37 @@ app.post("/scrape", async (req, res) => {
     }
 
     const data = await reviews.json();
-    const resBucket = await Promise.all(
-        data.reviews.map(async (d) => {
-            const scrapeRvw = await analyzeWithOpenRouter(
-                d.text,
-                d.rating,
-                model,
-            );
-            return scrapeRvw;
-        }),
-    );
 
-    res.json({
-        total_rows: data.reviews.length,
-        results: resBucket,
-    });
+    await withTrace(
+        "scrape",
+        {
+            input: { url, total_reviews, model },
+            metadata: {
+                endpoint: "/scrape",
+                scraped_count: data.reviews.length,
+            },
+            tags: ["scrape"],
+        },
+        async (span) => {
+            const resBucket = await Promise.all(
+                data.reviews.map(async (d) => {
+                    const scrapeRvw = await analyzeWithOpenRouter(
+                        d.text,
+                        d.rating,
+                        model,
+                    );
+                    return scrapeRvw;
+                }),
+            );
+
+            span?.update({ output: resBucket });
+
+            res.json({
+                total_rows: data.reviews.length,
+                results: resBucket,
+            });
+        },
+    );
 });
 
 app.listen(port, "0.0.0.0", () => {
@@ -319,3 +439,13 @@ app.listen(port, "0.0.0.0", () => {
         );
     }
 });
+
+async function shutdown(signal) {
+    console.log(`Received ${signal}, flushing Langfuse traces...`);
+    await flushTracing();
+    await shutdownTracing();
+    process.exit(0);
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
